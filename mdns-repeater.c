@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <syslog.h>
 #include <unistd.h>
 #include <pwd.h>
@@ -34,6 +35,10 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <errno.h>
+#include <netinet/if_ether.h>  // for struct ether_header
+#include <netinet/ip.h>        // for struct ip
+#include <netinet/udp.h>       // for struct udphdr
+#include <arpa/inet.h>
 
 #define PACKAGE "mdns-repeater"
 #define MDNS_ADDR "224.0.0.251"
@@ -45,6 +50,8 @@
 
 #define MAX_SOCKS 16
 #define MAX_SUBNETS 16
+
+#define MDNS_REPEATER_MARKER "_mdns-repeater-marker.local"
 
 struct if_sock {
 	const char *ifname;	/* interface name  */
@@ -80,6 +87,300 @@ int shutdown_flag = 0;
 char *pid_file = PIDFILE;
 
 const struct passwd* user = NULL;
+
+const char *marker_name = MDNS_REPEATER_MARKER;
+
+struct dns_header {
+    uint16_t id;
+    uint16_t flags;
+    uint16_t qdcount;
+    uint16_t ancount;
+    uint16_t nscount;
+    uint16_t arcount;
+} __attribute__((packed));
+
+static const char *dns_type_to_str(uint16_t type) {
+    switch (type) {
+        case 1:   return "A";
+        case 28:  return "AAAA";
+        case 12:  return "PTR";
+        case 16:  return "TXT";
+        case 33:  return "SRV";
+        case 2:   return "NS";
+        case 5:   return "CNAME";
+        default:  return "UNKNOWN";
+    }
+}
+
+static const char *dns_class_to_str(uint16_t cls) {
+    cls &= 0x7FFF; // strip cache-flush bit
+    switch (cls) {
+        case 1:   return "IN";
+        default:  return "UNKNOWN";
+    }
+}
+
+// Parse DNS name with compression support
+static int parse_name(const uint8_t *msg, size_t msg_len,
+                      const uint8_t *ptr, char *out, size_t out_len,
+                      const uint8_t **endptr)
+{
+    size_t len = 0;
+    const uint8_t *p = ptr;
+    int jumped = 0;
+    const uint8_t *jump_ptr = NULL;
+
+    while (p < msg + msg_len) {
+        uint8_t label_len = *p;
+        if (label_len == 0) { // end of name
+            p++;
+            break;
+        }
+
+        if ((label_len & 0xC0) == 0xC0) { // compression pointer
+            if (p + 1 >= msg + msg_len) return -1;
+            uint16_t offset = ((label_len & 0x3F) << 8) | *(p + 1);
+            if (offset >= msg_len) return -1;
+            if (!jumped) {
+                jump_ptr = p + 2; // where to continue after jump
+                jumped = 1;
+            }
+            p = msg + offset;
+            continue;
+        }
+
+        p++;
+        if (p + label_len > msg + msg_len) return -1;
+
+        if (len && len < out_len - 1) out[len++] = '.';
+        for (int i = 0; i < label_len && len < out_len - 1; i++) {
+            out[len++] = p[i];
+        }
+        p += label_len;
+    }
+
+    out[len] = '\0';
+    *endptr = jumped ? jump_ptr : p;
+    return 0;
+}
+
+void pretty_print_mdns(const uint8_t *pkt, size_t len)
+{
+    if (len < sizeof(struct dns_header)) return;
+
+    const struct dns_header *hdr = (const struct dns_header *)pkt;
+    uint16_t flags   = ntohs(hdr->flags);
+    uint16_t qdcount = ntohs(hdr->qdcount);
+    uint16_t ancount = ntohs(hdr->ancount);
+    uint16_t nscount = ntohs(hdr->nscount);
+    uint16_t arcount = ntohs(hdr->arcount);
+
+    printf("mDNS Packet: %s, %u questions, %u answers, %u auth, %u add\n",
+           (flags & 0x8000) ? "RESPONSE" : "QUERY",
+           qdcount, ancount, nscount, arcount);
+
+    const uint8_t *p = pkt + sizeof(struct dns_header);
+    char name[256];
+
+    // Questions
+    for (int i = 0; i < qdcount; i++) {
+        if (parse_name(pkt, len, p, name, sizeof(name), &p) != 0) return;
+        if (p + 4 > pkt + len) return;
+
+        uint16_t qtype = ntohs(*(uint16_t *)p); p += 2;
+        uint16_t qclass = ntohs(*(uint16_t *)p); p += 2;
+
+        printf("  Q[%d]: %-30s, type=%s (%u), class=%s%s\n",
+               i, name,
+               dns_type_to_str(qtype), qtype,
+               dns_class_to_str(qclass), (qclass & 0x8000) ? " (QU)" : "");
+    }
+
+    // Answers + Authorities + Additionals are all "resource records"
+    int rr_count = ancount + nscount + arcount;
+    for (int i = 0; i < rr_count; i++) {
+        if (parse_name(pkt, len, p, name, sizeof(name), &p) != 0) return;
+        if (p + 10 > pkt + len) return;
+
+        uint16_t type = ntohs(*(uint16_t *)p); p += 2;
+        uint16_t cls  = ntohs(*(uint16_t *)p); p += 2;
+        uint32_t ttl  = ntohl(*(uint32_t *)p); p += 4;
+        uint16_t rdlen= ntohs(*(uint16_t *)p); p += 2;
+        if (p + rdlen > pkt + len) return;
+
+        printf("  RR[%d]: %-30s, type=%s, class=%s%s, ttl=%u, rdlen=%u\n",
+               i, name, dns_type_to_str(type),
+               dns_class_to_str(cls), (cls & 0x8000) ? " (cache flush)" : "",
+               ttl, rdlen);
+
+        // For A and AAAA, print address
+        if (type == 1 && rdlen == 4) { // A
+            char ipbuf[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, p, ipbuf, sizeof(ipbuf));
+            printf("      A: %s\n", ipbuf);
+        } else if (type == 28 && rdlen == 16) { // AAAA
+            char ipbuf[INET6_ADDRSTRLEN];
+            inet_ntop(AF_INET6, p, ipbuf, sizeof(ipbuf));
+            printf("      AAAA: %s\n", ipbuf);
+        }
+
+        p += rdlen;
+    }
+}
+
+int set_mdns_marker(uint8_t *pkt, ssize_t *pkt_len, size_t max_len, uint32_t marker_ip_be)
+{
+    if (!pkt || !pkt_len) return -1;
+    if (*pkt_len < sizeof(struct dns_header)) return -1;
+
+    uint8_t *msg_base = pkt;
+    size_t msg_len = *pkt_len;
+    const uint8_t *msg_end = pkt + msg_len;
+
+    struct dns_header *hdr = (struct dns_header *)pkt;
+    uint16_t qdcount = ntohs(hdr->qdcount);
+    uint16_t ancount = ntohs(hdr->ancount);
+    uint16_t nscount = ntohs(hdr->nscount);
+    uint16_t arcount = ntohs(hdr->arcount);
+
+    const uint8_t *p = (const uint8_t *)pkt + sizeof(struct dns_header);
+    char name[256];
+
+    /* Skip Questions */
+    for (int i = 0; i < qdcount; i++) {
+        if (parse_name(msg_base, msg_len, p, name, sizeof(name), &p) != 0) return -1;
+        if (p + 4 > msg_end) return -1;
+        p += 4;
+    }
+
+    /* Skip Answers + Authority */
+    for (int i = 0; i < ancount + nscount; i++) {
+        if (parse_name(msg_base, msg_len, p, name, sizeof(name), &p) != 0) return -1;
+        if (p + 10 > msg_end) return -1;
+        uint16_t rdlen = ntohs(*(const uint16_t *)(p + 8));
+        p += 10 + rdlen;
+        if (p > msg_end) return -1;
+    }
+
+    /* Search Additional for existing marker */
+    const uint8_t *iter = p;
+    for (int i = 0; i < arcount; i++) {
+        if (parse_name(msg_base, msg_len, iter, name, sizeof(name), &iter) != 0) return -1;
+        const uint8_t *type_ptr = iter;
+        if (type_ptr + 10 > msg_end) return -1;
+
+        uint16_t type  = ntohs(*(const uint16_t *)(type_ptr + 0));
+        uint16_t rdlen = ntohs(*(const uint16_t *)(type_ptr + 8));
+        const uint8_t *rdata = type_ptr + 10;
+        if (rdata + rdlen > msg_end) return -1;
+
+        if (type == 1 && strcmp(name, marker_name) == 0 && rdlen == 4) {
+            /* Found existing A RR for marker_name */
+            memcpy((uint8_t*)rdata, &marker_ip_be, 4);
+            return 0;
+            }
+        iter = rdata + rdlen;
+    }
+
+    /* No existing marker: add a new RR */
+    uint8_t *w = pkt + msg_len;
+    if (w + strlen(marker_name) + 2 + 10 + 4 > pkt + max_len) return -1;
+
+    /* Encode QNAME */
+    const char *s = marker_name;
+    while (*s) {
+        const char *dot = strchr(s, '.');
+        size_t len = dot ? (size_t)(dot - s) : strlen(s);
+        *w++ = len;
+        memcpy(w, s, len);
+        w += len;
+        if (!dot) break;
+        s = dot + 1;
+    }
+    *w++ = 0;
+
+    *(uint16_t *)w = htons(1); w += 2;  /* TYPE=A */
+    *(uint16_t *)w = htons(1); w += 2;  /* CLASS=IN */
+    *(uint32_t *)w = htonl(0); w += 4;  /* TTL=0 */
+    *(uint16_t *)w = htons(4);  w += 2; /* RDLENGTH=4 */
+    memcpy(w, &marker_ip_be, 4); w += 4;
+
+    *pkt_len = w - pkt;
+    hdr->arcount = htons(arcount + 1);
+
+    return 0;
+}
+
+int has_mdns_marker(const uint8_t *pkt, size_t pkt_len, uint32_t marker_ip_be)
+{
+    if (!pkt || pkt_len < sizeof(struct dns_header))
+        return 0;
+    
+    const struct dns_header *hdr = (const struct dns_header *)pkt;
+
+    uint16_t qdcount = ntohs(hdr->qdcount);
+    uint16_t ancount = ntohs(hdr->ancount);
+    uint16_t nscount = ntohs(hdr->nscount);
+    uint16_t arcount = ntohs(hdr->arcount);
+
+    const uint8_t *p = pkt + sizeof(struct dns_header);
+    const uint8_t *msg_end = pkt + pkt_len;
+    char name[256];
+
+    /* Skip questions */
+    for (int i = 0; i < qdcount; i++) {
+        if (parse_name(pkt, pkt_len, p, name, sizeof(name), &p) != 0)
+            return 0;
+        if (p + 4 > msg_end) return 0;
+        p += 4;
+    }
+
+    /* Skip answers + authority */
+    for (int i = 0; i < ancount + nscount; i++) {
+        if (parse_name(pkt, pkt_len, p, name, sizeof(name), &p) != 0)
+            return 0;
+        if (p + 10 > msg_end) return 0;
+        uint16_t rdlen = ntohs(*(const uint16_t *)(p + 8));
+        p += 10 + rdlen;
+        if (p > msg_end) return 0;
+    }
+
+    /* Walk additional RRs looking for marker */
+    const uint8_t *iter = p;
+    for (int i = 0; i < arcount; i++) {
+        if (parse_name(pkt, pkt_len, iter, name, sizeof(name), &iter) != 0)
+            return 0;
+        const uint8_t *type_ptr = iter;
+        if (type_ptr + 10 > msg_end) return 0;
+
+        uint16_t type  = ntohs(*(const uint16_t *)(type_ptr + 0));
+        uint16_t rdlen = ntohs(*(const uint16_t *)(type_ptr + 8));
+        const uint8_t *rdata = type_ptr + 10;
+        if (rdata + rdlen > msg_end) return 0;
+
+        if (type == 1 && strcmp(name, marker_name) == 0 && (rdlen % 4) == 0) {
+            //printf("marker=0x%x ", marker_ip_be);
+            /* Found an A RR for _mdns-repeater-marker.local */
+            int num_ips = rdlen / 4;
+            for (int j = 0; j < num_ips; j++) {
+                //printf("0x%x ", (uint32_t)*((uint32_t*)((rdata + j * 4))));
+                if (memcmp(rdata + j * 4, &marker_ip_be, 4) == 0) {
+                    //printf("matched\n");
+                    return 1; /* this packet already has our marker */
+                }
+            }
+#if 0
+            printf("marker=0x%x no match ", marker_ip_be);
+            for (int j = 0; j < num_ips; j++)
+                printf("0x%x ", (uint32_t)*((uint32_t*)((rdata + j * 4))));
+            printf("\n");
+#endif
+        }
+        iter = rdata + rdlen;
+    }
+
+    return 0; /* no match found */
+}
 
 void log_message(int loglevel, char *fmt_str, ...) {
 	va_list ap;
@@ -173,6 +474,7 @@ static int create_send_sock(int recv_sockfd, const char *ifname, struct if_sock 
 	}
 
 	// compute network (address & mask)
+    sockdata->mask.s_addr = 0x00ffffff; // ETAY added 
 	sockdata->net.s_addr = sockdata->addr.s_addr & sockdata->mask.s_addr;
 
 	int on = 1;
@@ -598,26 +900,10 @@ int main(int argc, char *argv[]) {
 			if (recvsize < 0) {
 				log_message(LOG_ERR, "recv(): %s", strerror(errno));
 			}
+            if ( has_mdns_marker(pkt_data, recvsize, fromaddr.sin_addr.s_addr) )
+                continue;
 
 			int j;
-			char discard = 0;
-			char our_net = 0;
-			for (j = 0; j < num_socks; j++) {
-				// make sure packet originated from specified networks
-				if ((fromaddr.sin_addr.s_addr & socks[j].mask.s_addr) == socks[j].net.s_addr) {
-					our_net = 1;
-				}
-
-				// check for loopback
-				if (fromaddr.sin_addr.s_addr == socks[j].addr.s_addr) {
-					discard = 1;
-					break;
-				}
-			}
-
-			if (discard || !our_net)
-				continue;
-
 			if (num_whitelisted_subnets != 0) {
 				char whitelisted_packet = 0;
 				for (j = 0; j < num_whitelisted_subnets; j++) {
@@ -650,16 +936,14 @@ int main(int argc, char *argv[]) {
 				}
 			}
 
-			if (foreground)
-				printf("data from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
-
 			for (j = 0; j < num_socks; j++) {
 				// do not repeat packet back to the same network from which it originated
 				if ((fromaddr.sin_addr.s_addr & socks[j].mask.s_addr) == socks[j].net.s_addr)
 					continue;
 
-				if (foreground)
-					printf("repeating data to %s\n", socks[j].ifname);
+                if (foreground)
+					printf("repeating packet from %s to interface %s\n", inet_ntoa(fromaddr.sin_addr), socks[j].ifname);
+                set_mdns_marker(pkt_data, &recvsize, PACKET_SIZE, socks[j].addr.s_addr);
 
 				// repeat data
 				ssize_t sentsize = send_packet(socks[j].sockfd, pkt_data, (size_t) recvsize);
